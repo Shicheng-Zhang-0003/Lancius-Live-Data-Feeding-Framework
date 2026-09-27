@@ -34,6 +34,7 @@ clean:
 install: libsnapshot.so
 	install -d /usr/local/include/snapshot
 	install -m 644 include/snapshot.h /usr/local/include/snapshot/
+	install -m 644 include/assoc.h /usr/local/include/snapshot/
 	install -m 755 libsnapshot.so /usr/local/lib/
 
 .PHONY: all clean install

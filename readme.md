@@ -2,6 +2,64 @@
 
 **A zero-copy, streaming framework for extracting real-time web data into applications.**
 
+> **Implementation status (read before the spec below).** This readme
+> describes the full vision *plus* what exists today. Actually implemented:
+> growable buffers (`src/buffer.c`), one-shot HTTP fetch (`src/fetch.c`
+> `snap_fetch_once`), header-aware streaming CSV parsing (`src/parser_csv.c`),
+> JSON-array streaming (`src/parser_json.c`), JSON declarative source loading
+> (`src/config.c`), the ecological associated-data module
+> (`include/assoc.h`, `src/assoc.c` — FIRMS/Daymet/GBIF, libc-only, tested),
+> and two examples (`examples/fire_monitor.c`, `examples/multi_pipeline.c`).
+> **Roadmap, not yet built:** the declared `filter`/`project`/`enrich`
+> transforms, `http`/`kafka`/`s3`/`callback` outputs, distinct NDJSON
+> handling, binary/GeoTIFF/NetCDF parsers, the async `curl_multi` daemon
+> loop, metrics/checkpointing/registry, and everything under
+> "Universal Data Pipeline v2". Performance figures (~50KB, 100MB/s,
+> <1ms, 50+ streams) are design targets, not benchmarks. Treat the v2
+> sections as the architecture RFC and the file list above as the buildable
+> truth.
+
+## Building
+
+```bash
+# System dependencies (headers required, not just runtime libs)
+# Ubuntu/Debian: apt-get install libcurl4-openssl-dev libcjson-dev
+# RHEL/Fedora:   dnf install libcurl-devel cjson-devel
+# macOS:         brew install curl cjson
+
+make              # examples + objects (src/*.c picked up automatically)
+make libsnapshot.so
+make install      # installs snapshot.h + assoc.h + libsnapshot.so
+```
+
+The associated-data module and its test need **libc only**:
+
+```bash
+gcc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Iinclude \
+    tests/test_assoc.c src/assoc.c -o /tmp/test_assoc && /tmp/test_assoc
+```
+
+## Repository Map
+
+```
+3463-LDFD/
+├── include/snapshot.h     # core types: buffer/chunk, parser/transform/output vtables,
+│                          #   source/pipeline/context, buffer + framework API
+├── include/parser_csv.h   # csv_row_cb_t + snap_csv_set_callback()
+├── include/assoc.h        # associated-data module (FIRMS/Daymet/GBIF, Idea1 feeds)
+├── src/buffer.c           # growable reusable byte buffer
+├── src/context.c          # context lifecycle + source registration + run-once
+├── src/fetch.c            # libcurl easy (one-shot) + multi (async loop) fetch tasks
+├── src/parser_csv.c       # streaming CSV (quoted fields, custom delimiter)
+├── src/parser_json.c      # streaming JSON-array parser (NDJSON alias: same unit)
+├── src/config.c           # snap_ctx_load_config() from declarative JSON
+├── src/assoc.c            # associated-data module (see dedicated section below)
+├── examples/fire_monitor.c      # hourly FIRMS poll, FRP>100 alert callback
+├── examples/multi_pipeline.c    # dual FIRMS + Daymet pipelines with stats thread
+├── examples/pipeline_config.json# 4-source declarative config (FIRMS/GBIF/Daymet)
+└── tests/test_assoc.c     # 4 scenario tests for the assoc module (no network)
+```
+
 The Lancius Live Data Feeding Framework is a lightweight C library for building continuous data pipelines that fetch, parse, transform, and route live HTTP data streams — without ever writing to disk.
 
 Modern applications need live data: market ticks, sensor readings, API feeds, public datasets. Traditional approaches download entire files, parse them, then process — wasting memory, latency, and bandwidth.
@@ -604,3 +662,84 @@ void snap_meta_free(snap_metadata_t *m);
 
 - **Lancius (3344)** — C ML compiler/runtime this feeds: https://github.com/Shicheng-Zhang-0003/Lancius
 - **BDC (243)** — Internal project using this framework
+
+## Associated-Data Module (`include/assoc.h`, `src/assoc.c`)
+
+Specialised, self-contained section for ecological "associated data"
+(Idea1 protocol Sec 6–7): FIRMS active-fire CSV, Daymet single-pixel climate
+CSV, and GBIF occurrence JSON. It owns its own line buffering, header
+capture, and typed conversion, and deliberately does **not** sit on the
+generic `snap_csv` parser (which consumes header rows internally, making
+name-based lookup impossible through it) — no core files were changed, and
+the module compiles on libc alone.
+
+### Data model
+
+```c
+assoc_bbox_t    { lat_min, lat_max, lon_min, lon_max }   // NULL = no filter
+assoc_fire_t    { lat, lon, brightness, frp, acq_date[16], satellite[16],
+                  confidence_raw[16], confidence_num, confidence_class }
+                // confidence_num >= 0 for numeric tokens ("88"), else -1;
+                // confidence_class: 0 low, 1 nominal/n, 2 high/h, -1 unknown/numeric
+assoc_climate_t { year, yday, dayl_s, prcp_mmd, srad_wm2, tmax_c, tmin_c,
+                  vp_pa, has_swe, swe_mm }
+assoc_occ_t     { species[64], lat, lon, uncert_m (-1 when absent),
+                  event_date[32], basis[32] }
+```
+
+### API
+
+| Function | Purpose |
+|----------|---------|
+| `assoc_phase1_bbox()` | Phase-1 study bbox matching `configs/params.yaml` (49.0–51.2N, 114.5–110.0W) |
+| `assoc_in_bbox(bbox, lat, lon)` | Bounds check; `NULL` bbox always passes |
+| `assoc_fire_feed_new(cb, udata, &opts)` | FIRMS feed; `opts = { min_frp (<0 disables), bbox (NULL disables) }` |
+| `assoc_fire_feed(f, data, len)` | Push a raw chunk (call per `curl` write; split mid-row is fine) |
+| `assoc_fire_feed_free(f)` | Flushes a trailing line without `\n`, then frees |
+| `assoc_climate_feed_new(cb, udata)` / `assoc_climate_feed` / `assoc_climate_feed_free` | Same pattern for Daymet |
+| `assoc_gbif_parse_page(json, len, species_label, cb, udata, bbox, max_uncert_m, &kept, &skipped)` | One GBIF `occurrence/search` page; returns emitted count or `-1` on malformed JSON; `max_uncert_m < 0` disables the uncertainty filter; records *without* uncertainty are always kept |
+
+Header handling: the first line containing a known token becomes the header
+(FIRMS: `latitude…frp` incl. VIIRS `bright_ti4`; Daymet: `year…vp`), earlier
+lines (Daymet's 6-line preamble) are skipped, and lookup falls back to the
+canonical positional order when a header is absent. Spaced Daymet headers
+normalise (`prcp (mm/day)` → `prcp`). Quoted CSV fields are honoured.
+
+### Worked example
+
+```c
+#include "assoc.h"
+#include <stdio.h>
+
+static void on_fire(const assoc_fire_t *f, void *udata) {
+    (void)udata;
+    printf("FIRE %.4f,%.4f FRP %.1f MW conf %s\n",
+           f->lat, f->lon, f->frp, f->confidence_raw);
+}
+
+int main(void) {
+    assoc_bbox_t bb = assoc_phase1_bbox();
+    assoc_fire_opts_t opts = { 10.0, &bb };          // FRP>=10, Phase-1 bbox
+    assoc_fire_feed_t *feed = assoc_fire_feed_new(on_fire, NULL, &opts);
+    /* push each HTTP chunk as it arrives: */
+    // assoc_fire_feed(feed, chunk_bytes, chunk_len);
+    assoc_fire_feed_free(feed);                       // flush + free
+    return 0;
+}
+```
+
+### Tests
+
+`tests/test_assoc.c` — 4 network-free scenarios built from the repo's real
+header/row shapes: MODIS row incl. split-chunk streaming; VIIRS strings +
+FRP/bbox filtering with unterminated last line; Daymet preamble + spaced
+headers; GBIF bbox + uncertainty filtering. Build + run:
+
+```bash
+gcc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Iinclude \
+    tests/test_assoc.c src/assoc.c -o /tmp/test_assoc && /tmp/test_assoc
+# assoc tests: all pass
+```
+
+The module is picked up by the normal `make` via the `src/*.c` wildcard, and
+`make install` ships `assoc.h` alongside `snapshot.h`.
