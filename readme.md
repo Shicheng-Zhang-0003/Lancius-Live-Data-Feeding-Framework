@@ -1,14 +1,12 @@
-# LDFD — Live Data Feed Daemon
+# The Lancius Live Data Feeding Framework
 
 **A zero-copy, streaming framework for extracting real-time web data into applications.**
 
-LDFD (Live Data Feed Daemon) is a lightweight C library for building continuous data pipelines that fetch, parse, transform, and route live HTTP data streams — without ever writing to disk.
-
-## Why LDFD?
+The Lancius Live Data Feeding Framework is a lightweight C library for building continuous data pipelines that fetch, parse, transform, and route live HTTP data streams — without ever writing to disk.
 
 Modern applications need live data: market ticks, sensor readings, API feeds, public datasets. Traditional approaches download entire files, parse them, then process — wasting memory, latency, and bandwidth.
 
-LDFD streams data **chunk-by-chunk** through a composable pipeline:
+LLDFF streams data **chunk-by-chunk** through a composable pipeline:
 
 ```
 HTTP Source → Streaming Parser → Transforms → Output Sink
