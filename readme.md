@@ -4,16 +4,22 @@
 
 > **Implementation status (read before the spec below).** This readme
 > describes the full vision *plus* what exists today. Actually implemented:
-> growable buffers (`src/buffer.c`), one-shot HTTP fetch (`src/fetch.c`
-> `snap_fetch_once`), header-aware streaming CSV parsing (`src/parser_csv.c`),
-> JSON-array streaming (`src/parser_json.c`), JSON declarative source loading
-> (`src/config.c`), the ecological associated-data module
+> growable buffers (`src/buffer.c`, null-safe), one-shot + async HTTP fetch
+> (`src/fetch.c` — `snap_fetch_once`, `snap_ctx_start/stop/run_once` with a
+> dedicated `loop_thread`, modern `XFERINFO` callback, header-list ownership),
+> header-aware streaming CSV parsing (`src/parser_csv.c` — quoted fields,
+> custom `delimiter=`/`skip=N` config, correct header ownership, CRLF-safe),
+> buffered JSON-array + line-split NDJSON parsing (`src/parser_json.c` with
+> `snap_json_set_callback`), JSON declarative source loading with validation
+> (`src/config.c` — `snap_ctx_load_config`, `snap_source_from_json`, invalid
+> rows skipped), the ecological associated-data module
 > (`include/assoc.h`, `src/assoc.c` — FIRMS/Daymet/GBIF, libc-only, tested),
-> and two examples (`examples/fire_monitor.c`, `examples/multi_pipeline.c`).
-> **Roadmap, not yet built:** the declared `filter`/`project`/`enrich`
-> transforms, `http`/`kafka`/`s3`/`callback` outputs, distinct NDJSON
-> handling, binary/GeoTIFF/NetCDF parsers, the async `curl_multi` daemon
-> loop, metrics/checkpointing/registry, and everything under
+> and two examples (`examples/fire_monitor.c`, `examples/multi_pipeline.c`,
+> both on the public `snap_csv_set_callback` API).
+> `make` builds examples + `libsnapshot.so`; `make test` runs the network-free
+> assoc suite. **Roadmap, not yet built:** the declared `filter`/`project`/`enrich`
+> transforms, `http`/`kafka`/`s3`/`callback` outputs, binary/GeoTIFF/NetCDF
+> parsers, metrics/checkpointing/registry, and everything under
 > "Universal Data Pipeline v2". Performance figures (~50KB, 100MB/s,
 > <1ms, 50+ streams) are design targets, not benchmarks. Treat the v2
 > sections as the architecture RFC and the file list above as the buildable
@@ -23,19 +29,27 @@
 
 ```bash
 # System dependencies (headers required, not just runtime libs)
-# Ubuntu/Debian: apt-get install libcurl4-openssl-dev libcjson-dev
-# RHEL/Fedora:   dnf install libcurl-devel cjson-devel
-# macOS:         brew install curl cjson
+# Ubuntu/Debian: apt-get install build-essential pkg-config libcurl4-openssl-dev libcjson-dev
+# RHEL/Fedora:   dnf install gcc make pkgconf libcurl-devel cjson-devel
+# macOS:         brew install curl cjson pkg-config
 
-make              # examples + objects (src/*.c picked up automatically)
-make libsnapshot.so
-make install      # installs snapshot.h + assoc.h + libsnapshot.so
+make              # C17, pkg-config cflags/libs: examples + libsnapshot.so
+make test         # network-free assoc suite (libc only)
+make strict       # -Wconversion syntax check over src + examples
+make analyze      # gcc -fanalyzer syntax check
+make sanitize     # ASan+UBSan rebuild + test
+make install      # installs snapshot.h + assoc.h + parser_csv.h + libsnapshot.so
 ```
+
+Toolchain: `-std=c17`, `-Wall -Wextra -Wpedantic -Wshadow` clean under both
+gcc 15 and clang 21; verified with `libcurl 8.18.0 + cJSON 1.7.19`.
+`valgrind --leak-check=full` is clean on the assoc and core harnesses
+(the 56-byte still-reachable block is `curl_global_init`, freed at exit).
 
 The associated-data module and its test need **libc only**:
 
 ```bash
-gcc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Iinclude \
+gcc -std=c17 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Iinclude \
     tests/test_assoc.c src/assoc.c -o /tmp/test_assoc && /tmp/test_assoc
 ```
 
@@ -165,9 +179,12 @@ snap_csv_set_callback(parser, on_row, my_context);
 
 | Format | Parser | Notes |
 |--------|--------|-------|
-| CSV | `snap_csv_parser` | Handles quoted fields, custom delimiters |
-| JSON | `snap_json_parser` | Streams array objects incrementally |
-| NDJSON | `snap_ndjson_parser` | One JSON object per line |
+| CSV | `snap_csv_parser` | Quoted fields, CRLF-safe, `parser_config="delimiter=;skip=6"` (Daymet preamble); register rows with `snap_csv_set_callback(ctx, cb, udata)` |
+| JSON | `snap_json_parser` | Buffers array/object documents (chunk-split safe), emits each element/object via `snap_json_set_callback`; parsed on `flush` |
+| NDJSON | `snap_ndjson_parser` | One JSON object per line (split-chunk safe, unterminated last line flushed) |
+
+> For FIRMS/Daymet/GBIF ecological feeds prefer the libc-only `assoc` module
+> below: it does header-name lookup and preamble handling without cJSON.
 
 ## Built-in Transforms
 
@@ -300,12 +317,12 @@ const snap_output_t my_output = {
 
 ```bash
 # Dependencies
-# Ubuntu/Debian: apt-get install libcurl4-openssl-dev libcjson-dev
-# RHEL/Fedora: dnf install libcurl-devel cjson-devel
-# macOS: brew install curl cjson
+# Ubuntu/Debian: apt-get install build-essential pkg-config libcurl4-openssl-dev libcjson-dev
+# RHEL/Fedora: dnf install gcc make pkgconf libcurl-devel cjson-devel
+# macOS: brew install curl cjson pkg-config
 
-make              # Build examples + library
-make libsnapshot.so  # Shared library
+make              # Build examples + library (C17 + pkg-config)
+make test         # Assoc suite (no network)
 make install      # System install (requires root)
 ```
 
@@ -313,11 +330,11 @@ make install      # System install (requires root)
 
 ```bash
 # Static
-gcc -std=c11 -I3463-LDFD/include your_app.c \
+gcc -std=c17 -I3463-LDFD/include your_app.c \
     3463-LDFD/obj/*.o -lcurl -lcjson -lpthread -o your_app
 
 # Shared
-gcc -std=c11 -I3463-LDFD/include your_app.c \
+gcc -std=c17 -I3463-LDFD/include your_app.c \
     -L3463-LDFD -lsnapshot -o your_app
 ```
 
@@ -736,7 +753,7 @@ FRP/bbox filtering with unterminated last line; Daymet preamble + spaced
 headers; GBIF bbox + uncertainty filtering. Build + run:
 
 ```bash
-gcc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Iinclude \
+gcc -std=c17 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Iinclude \
     tests/test_assoc.c src/assoc.c -o /tmp/test_assoc && /tmp/test_assoc
 # assoc tests: all pass
 ```
