@@ -22,11 +22,15 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <time.h>
+#include <pthread.h>
 #include <curl/curl.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Forward declarations (keeps cJSON/curl specifics out of this header). */
+struct cJSON;
 
 /* ============================================================================
  * Core Types
@@ -109,8 +113,8 @@ typedef struct snap_pipeline {
     snap_transform_t *transforms;
     int n_transforms;
     snap_output_t output;
-    int running;
-    pthread_t thread;
+    int running;       /* deprecated: scheduling now lives on snap_ctx_t */
+    pthread_t thread;  /* deprecated: use snap_ctx_t.loop_thread */
 } snap_pipeline_t;
 
 /* Global framework context */
@@ -119,6 +123,9 @@ typedef struct snap_ctx {
     int n_pipelines;
     CURLM *multi_handle;
     int shutdown;
+    int running;             /* async loop active (set by snap_ctx_start) */
+    pthread_t loop_thread;   /* background curl_multi loop */
+    int loop_thread_valid;
 } snap_ctx_t;
 
 /* ============================================================================
@@ -141,6 +148,14 @@ snap_error_t snap_ctx_add_source(snap_ctx_t *ctx, const snap_source_t *src);
 snap_error_t snap_ctx_start(snap_ctx_t *ctx);
 snap_error_t snap_ctx_stop(snap_ctx_t *ctx);
 snap_error_t snap_ctx_run_once(snap_ctx_t *ctx);  /* Single snapshot all sources */
+snap_error_t snap_ctx_load_config(snap_ctx_t *ctx, const char *config_file);
+/* Parse one {"name","url",...} source object (cJSON kept forward-declared). */
+snap_source_t *snap_source_from_json(struct cJSON *obj);
+
+/* One-shot fetch: stream URL through parser (declared here so
+ * context.c / examples need no private fetch_task_t knowledge). */
+snap_error_t snap_fetch_once(const char *url, const char *auth_header,
+                             snap_parser_t *parser, void *parser_ctx);
 
 /* ============================================================================
  * Built-in Parsers
@@ -149,6 +164,12 @@ snap_error_t snap_ctx_run_once(snap_ctx_t *ctx);  /* Single snapshot all sources
 extern const snap_parser_t snap_csv_parser;
 extern const snap_parser_t snap_json_parser;
 extern const snap_parser_t snap_ndjson_parser;
+
+/* JSON object callback (cJSON forward-declared so <cjson/cJSON.h> is only
+ * needed by the .c file and by users that actually consume objects). */
+void snap_json_set_callback(void *parser_ctx,
+                            void (*cb)(struct cJSON *obj, void *udata),
+                            void *udata);
 
 /* ============================================================================
  * Built-in Transforms

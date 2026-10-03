@@ -1,6 +1,6 @@
 /*
  * LDFD - Associated-data module tests (no network, no extra deps).
- * Build: gcc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Iinclude \
+ * Build: gcc -std=c17 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Iinclude \
  *          tests/test_assoc.c src/assoc.c -o /tmp/test_assoc && /tmp/test_assoc
  */
 #include "assoc.h"
