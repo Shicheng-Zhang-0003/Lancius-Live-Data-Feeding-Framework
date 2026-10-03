@@ -23,6 +23,7 @@
 #define DEFAULT_CAP 4096
 
 void snap_buffer_init(snap_buffer_t *buf, size_t initial_cap) {
+    if (!buf) return;
     buf->cap = initial_cap > 0 ? initial_cap : DEFAULT_CAP;
     buf->len = 0;
     buf->data = malloc(buf->cap);
@@ -30,11 +31,13 @@ void snap_buffer_init(snap_buffer_t *buf, size_t initial_cap) {
 }
 
 void snap_buffer_append(snap_buffer_t *buf, const uint8_t *data, size_t len) {
+    if (!buf || !data || len == 0) return;
+    if (!buf->data) return; /* prior OOM: stay empty rather than crash */
     if (buf->len + len > buf->cap) {
-        size_t new_cap = buf->cap * 2;
+        size_t new_cap = buf->cap ? buf->cap * 2 : DEFAULT_CAP;
         while (buf->len + len > new_cap) new_cap *= 2;
         uint8_t *new_data = realloc(buf->data, new_cap);
-        if (!new_data) return;
+        if (!new_data) return; /* keep old buffer intact on OOM */
         buf->data = new_data;
         buf->cap = new_cap;
     }
@@ -43,10 +46,12 @@ void snap_buffer_append(snap_buffer_t *buf, const uint8_t *data, size_t len) {
 }
 
 void snap_buffer_reset(snap_buffer_t *buf) {
+    if (!buf) return;
     buf->len = 0;
 }
 
 void snap_buffer_free(snap_buffer_t *buf) {
+    if (!buf) return;
     free(buf->data);
     buf->data = NULL;
     buf->len = buf->cap = 0;
