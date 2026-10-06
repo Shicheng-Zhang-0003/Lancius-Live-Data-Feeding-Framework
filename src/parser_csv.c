@@ -199,6 +199,24 @@ static void csv_free(void *ctx) {
     free(c);
 }
 
+/* Despot truth: header_done/headers/lines_seen were never cleared between
+ * responses, so every re-poll after the first re-emitted the header row as a
+ * data record (fire_monitor printed a bogus FIRE 0.0000,0.0000 every hour).
+ * Reset per-response state but KEEP row_cb/udata, which the caller registers
+ * once via snap_csv_set_callback(). */
+static snap_error_t csv_reset(void *ctx) {
+    csv_parser_ctx_t *c = ctx;
+    if (!c) return SNAP_ERR_CONFIG;
+    if (c->headers) csv_free_fields(c->headers, c->n_headers);
+    c->headers = NULL;
+    c->n_headers = 0;
+    c->header_done = 0;
+    c->lines_seen = 0;
+    snap_buffer_reset(&c->line_buf);
+    snap_buffer_reset(&c->out_buf);
+    return SNAP_OK;
+}
+
 void snap_csv_set_callback(void *parser_ctx, csv_row_cb_t cb, void *udata) {
     csv_parser_ctx_t *c = parser_ctx;
     if (!c) return;
@@ -210,5 +228,6 @@ const snap_parser_t snap_csv_parser = {
     .init = csv_init,
     .feed = csv_feed,
     .flush = csv_flush,
-    .free = csv_free
+    .free = csv_free,
+    .reset = csv_reset
 };

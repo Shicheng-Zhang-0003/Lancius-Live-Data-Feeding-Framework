@@ -152,16 +152,29 @@ static void json_free(void *ctx) {
     free(c);
 }
 
+/* Clear buffered bytes for a fresh response, keeping obj_cb/udata (the caller
+ * registers those once). Without this a re-poll would append the new
+ * document onto the previous one and fail to parse. */
+static snap_error_t json_reset(void *ctx) {
+    json_parser_ctx_t *c = ctx;
+    if (!c) return SNAP_ERR_CONFIG;
+    snap_buffer_reset(&c->buffer);
+    snap_buffer_reset(&c->line_buf);
+    return SNAP_OK;
+}
+
 const snap_parser_t snap_json_parser = {
     .init = json_init,
     .feed = json_feed,
     .flush = json_flush,
-    .free = json_free
+    .free = json_free,
+    .reset = json_reset
 };
 
 const snap_parser_t snap_ndjson_parser = {
     .init = ndjson_init,
     .feed = json_feed,
     .flush = json_flush,
-    .free = json_free
+    .free = json_free,
+    .reset = json_reset
 };
