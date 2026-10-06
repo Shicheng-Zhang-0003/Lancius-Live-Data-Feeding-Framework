@@ -89,12 +89,14 @@ static double num_or(const char *s, double dflt) {
  * Handles \n, \r\n, and quoted fields (embedded commas/newlines in quotes).
  * ============================================================================ */
 
-#define ASSOC_MAX_COLS 32
+#define ASSOC_MAX_COLS 64
 #define ASSOC_MAX_LINE (1u << 20) /* 1MB sanity cap per line */
 
 typedef struct assoc_core {
     char *line;
     size_t len, cap;
+    int overflow;        /* current line exceeded ASSOC_MAX_LINE: reject it */
+    int closed_quote;    /* saw a closing quote; next byte must be , or EOL */
     char *names[ASSOC_MAX_COLS];
     int n_names;
     int header_done;
@@ -108,52 +110,112 @@ typedef struct assoc_core {
 static void core_push(assoc_core_t *g, char c) {
     if (g->len + 1 >= g->cap) {
         size_t nc = g->cap ? g->cap * 2 : 1024;
-        if (nc > ASSOC_MAX_LINE) return; /* drop overflow silently */
+        if (nc > ASSOC_MAX_LINE) {
+            /* Despot truth: mark the row poisoned instead of dropping bytes
+             * silently. A truncated field parses as a valid-looking number,
+             * so emitting it would fabricate measurements. */
+            g->overflow = 1;
+            return;
+        }
         char *nd = realloc(g->line, nc);
-        if (!nd) return;
+        if (!nd) { g->overflow = 1; return; }
         g->line = nd;
         g->cap = nc;
     }
     g->line[g->len++] = c;
 }
 
-/* Split line into fields (comma-separated, double-quote aware). Returns count. */
+/* Does this token start with a number? Used to tell Daymet preamble lines
+ * ("Latitude: 37.7749 ...") from data rows while no header is known yet. */
+static int looks_numeric(const char *s) {
+    if (!s) return 0;
+    while (*s == ' ' || *s == '\t') s++;
+    char *end = NULL;
+    strtod(s, &end);
+    return end && end != s;
+}
+
+/*
+ * Split line into fields (comma-separated, RFC4180 double-quote aware, in
+ * place). Surrounding quotes are stripped and "" collapses to a single
+ * quote. Returns the field count, or -1 if the row must be rejected:
+ * unterminated quote, junk after a closing quote, or more than `cap` fields.
+ * Rejecting (rather than truncating) is deliberate: a silently shortened
+ * row is indistinguishable from a real measurement.
+ */
 static int core_split(char *line, const char **out, int cap) {
     int n = 0;
     char *p = line;
     char *field = line;
     int in_q = 0;
-    while (n < cap) {
+    int closed = 0;   /* previous byte was a closing quote */
+
+    while (*p) {
         char c = *p;
-        if (c == '"') {
-            if (in_q && *(p + 1) == '"') { p += 2; continue; } /* escaped quote */
-            in_q = !in_q;
+        if (in_q) {
+            if (c == '"') {
+                if (p[1] == '"') {
+                    /* escaped quote: shift the tail left, then step over the
+                     * single surviving quote (advance-after-shift matters:
+                     * """" must decode to one quote, not empty). */
+                    memmove(p, p + 1, strlen(p + 1) + 1);
+                    p++;
+                    continue;
+                }
+                *p = '\0';   /* closing quote ends the content */
+                in_q = 0;
+                closed = 1;
+                p++;
+                continue;
+            }
             p++;
             continue;
         }
-        if ((c == ',' && !in_q) || c == '\0') {
-            *p = '\0';
-            /* strip one pair of surrounding quotes */
-            size_t fl = strlen(field);
-            if (fl >= 2 && field[0] == '"' && field[fl - 1] == '"') {
-                field[fl - 1] = '\0';
-                field++;
-            }
-            out[n++] = field;
-            if (c == '\0') break;
+        if (closed) {
+            /* RFC4180: only a delimiter or end-of-line may follow a quote. */
+            if (c != ',') return -1;
+            closed = 0;
+        }
+        if (c == '"' && p == field && !in_q) {
+            in_q = 1;         /* opening quote is stripped by advancing field */
             field = p + 1;
+            p++;
+            continue;
+        }
+        if (c == ',') {
+            *p = '\0';
+            if (n >= cap) return -1;
+            out[n++] = field;
+            field = p + 1;
+            p++;
+            continue;
         }
         p++;
     }
+    if (in_q) return -1;            /* unterminated quote */
+    if (n >= cap) return -1;        /* more fields than we can hold */
+    out[n++] = field;
     return n;
 }
 
 static void core_emit_line(assoc_core_t *g) {
+    if (g->overflow) {
+        /* Over-long or unrecoverable row: drop it whole. Emitting the
+         * surviving prefix would yield a truncated field that still parses
+         * as a plausible number. */
+        g->len = 0;
+        g->overflow = 0;
+        return;
+    }
     if (g->len == 0) return;
     g->line[g->len] = '\0';
     const char *fields[ASSOC_MAX_COLS];
-    /* copy: core_split writes NULs into g->line, fields point into it */
+    /* core_split writes NULs into g->line; fields point into it. */
     int n = core_split(g->line, fields, ASSOC_MAX_COLS);
+    g->len = 0;
+    if (n <= 0) return;             /* malformed row: reject, do not guess */
+    if (!g->row) return;            /* no sink: parse into nothing, safely */
+
     if (!g->header_done) {
         int hits = 0;
         for (int i = 0; i < n; i++) {
@@ -170,15 +232,18 @@ static void core_emit_line(assoc_core_t *g) {
             g->n_names = n;
             for (int i = 0; i < n; i++) g->names[i] = strdup(fields[i]);
             g->header_done = 1;
+            return;                 /* header row is never data */
         }
-        /* preamble and header rows are never forwarded */
-    } else if (n > 0) {
-        g->row(fields, n, (const char **)g->names, g->n_names, g->udata);
+        /* No header in sight. Preamble lines are prose ("Latitude: ...");
+         * data rows start with a number. Forward only the latter so the
+         * documented positional fallback actually works headerlessly. */
+        if (!looks_numeric(fields[0])) return;
     }
-    g->len = 0;
+    g->row(fields, n, (const char **)g->names, g->n_names, g->udata);
 }
 
 static void core_bytes(assoc_core_t *g, const unsigned char *data, size_t len) {
+    if (!g) return;
     for (size_t i = 0; i < len; i++) {
         char c = (char)data[i];
         if (c == '\r') continue;
@@ -192,6 +257,8 @@ static void core_free(assoc_core_t *g) {
     core_emit_line(g); /* flush trailing line without newline */
     for (int i = 0; i < g->n_names; i++) free(g->names[i]);
     free(g->line);
+    g->line = NULL;
+    g->cap = g->len = 0;
 }
 
 /* ============================================================================
@@ -255,6 +322,9 @@ static const char *fire_known[] = { "latitude", "longitude", "brightness", "brig
 
 assoc_fire_feed_t *assoc_fire_feed_new(assoc_fire_cb_t cb, void *udata,
                                        const assoc_fire_opts_t *opts) {
+    if (!cb) return NULL;   /* despot truth: NULL cb was a guaranteed SIGSEGV
+                             * on the first data row (core_emit_line called it
+                             * unconditionally). Fail at construction instead. */
     struct assoc_fire_feed *s = calloc(1, sizeof *s);
     if (!s) return NULL;
     s->cb = cb;
@@ -330,6 +400,7 @@ static const char *clim_known[] = { "year", "yday", "dayl", "prcp",
                                     "srad", "tmax", "tmin", "vp" };
 
 assoc_climate_feed_t *assoc_climate_feed_new(assoc_climate_cb_t cb, void *udata) {
+    if (!cb) return NULL;   /* see assoc_fire_feed_new */
     struct assoc_climate_feed *s = calloc(1, sizeof *s);
     if (!s) return NULL;
     s->cb = cb;
@@ -456,39 +527,67 @@ static void field_str(const char *o, const char *oend, const char *key, char *ds
     dst[j] = '\0';
 }
 
+/* Locate the top-level "results" key. Must skip occurrences inside string
+ * values: a record whose value contains the literal text "results" used to
+ * hijack the scan and fail the whole page. Walks the document tracking string
+ * state and object depth, and only accepts a key at depth 1 followed by ':'. */
+static const char *find_results_key(const char *json, const char *end) {
+    const char *needle = "\"results\"";
+    const size_t nl = 9;
+    const char *p = json;
+    int depth = 0, in_str = 0, esc = 0;
+    while (p + nl <= end) {
+        char c = *p;
+        if (in_str) {
+            if (esc) esc = 0;
+            else if (c == '\\') esc = 1;
+            else if (c == '"') in_str = 0;
+            p++;
+            continue;
+        }
+        if (c == '"') {
+            if (depth == 1 && memcmp(p, needle, nl) == 0) {
+                /* Must be a KEY: a value that merely spells "results" is
+                 * followed by , or } rather than a colon. */
+                const char *q = skip_ws(p + nl, end);
+                if (q < end && *q == ':') return p;
+            }
+            in_str = 1;
+            p++;
+            continue;
+        }
+        if (c == '{' || c == '[') depth++;
+        else if (c == '}' || c == ']') depth--;
+        p++;
+    }
+    return NULL;
+}
+
 int assoc_gbif_parse_page(const char *json, size_t len, const char *species_label,
                           assoc_occ_cb_t cb, void *udata,
                           const assoc_bbox_t *bbox, double max_uncert_m,
                           int *out_kept, int *out_skipped) {
-    if (out_kept) *out_kept = 0;
-    if (out_skipped) *out_skipped = 0;
     if (!json || len == 0 || !cb) return -1;
     const char *end = json + len;
+    /* Declared before any goto: jumping over an initializer would leave the
+     * tallies as garbage on the malformed path. */
+    int kept = 0, skipped = 0;
 
-    /* locate "results" array */
-    const char *rk = NULL;
-    {
-        const char *needle = "\"results\"";
-        size_t nl = 9;
-        for (const char *p = json; p + nl <= end; p++) {
-            if (memcmp(p, needle, nl) == 0) { rk = p; break; }
-        }
-    }
-    if (!rk) return -1;
+    const char *rk = find_results_key(json, end);
+    if (!rk) goto malformed;
     const char *arr = rk + 9;
     arr = skip_ws(arr, end);
-    if (arr >= end || *arr != ':') return -1;
+    if (arr >= end || *arr != ':') goto malformed;
     arr = skip_ws(arr + 1, end);
-    if (arr >= end || *arr != '[') return -1;
+    if (arr >= end || *arr != '[') goto malformed;
 
-    int kept = 0, skipped = 0;
     const char *p = arr + 1;
     while (p < end) {
         p = skip_ws(p, end);
-        if (p >= end) break;
+        if (p >= end) goto malformed;
         if (*p == ']') break;
         if (*p == ',') { p++; continue; }
-        if (*p != '{') return -1;
+        if (*p != '{') goto malformed;
         /* match braces respecting strings */
         const char *o = p;
         int depth = 0, in_str = 0, esc = 0;
@@ -506,7 +605,7 @@ int assoc_gbif_parse_page(const char *json, size_t len, const char *species_labe
             }
             q++;
         }
-        if (q >= end) return -1;
+        if (q >= end) goto malformed;
         const char *oend = q + 1;
 
         int f1 = 0, f2 = 0, fu = 0;
@@ -531,4 +630,13 @@ int assoc_gbif_parse_page(const char *json, size_t len, const char *species_labe
     if (out_kept) *out_kept = kept;
     if (out_skipped) *out_skipped = skipped;
     return kept;
+
+malformed:
+    /* Despot truth: a mid-document failure used to return -1 with the
+     * out-params still zeroed, so a caller that had already received
+     * records through cb saw "kept=0" for records it had been handed.
+     * Report what actually happened and mark the document unusable. */
+    if (out_kept) *out_kept = kept;
+    if (out_skipped) *out_skipped = skipped;
+    return -1;
 }

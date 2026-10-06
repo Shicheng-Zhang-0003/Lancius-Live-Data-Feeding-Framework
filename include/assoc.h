@@ -120,7 +120,13 @@ typedef void (*assoc_occ_cb_t)(const assoc_occ_t *occ, void *udata);
  * species_label: e.g. "Bromus tectorum" for this page.
  * bbox: NULL disables spatial filter. max_uncert_m: <0 disables uncertainty filter;
  *   records WITHOUT uncertainty are always kept (PDF Sec 10: down-weight, not drop).
- * Returns emitted count, or -1 on malformed JSON. Tallies via out_kept/out_skipped (nullable).
+ *
+ * Returns the number of records emitted, or -1 if the document is malformed
+ * partway through. On -1 the out_kept / out_skipped tallies still describe
+ * what actually happened, because records before the fault have already been
+ * handed to cb -- a caller that ignored them would otherwise believe nothing
+ * was ever emitted. Check the return value, not the tallies, for validity.
+ * Tallies are written even on -1 (both out params are nullable).
  */
 int assoc_gbif_parse_page(const char *json, size_t len, const char *species_label,
                           assoc_occ_cb_t cb, void *udata,
