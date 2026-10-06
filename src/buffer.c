@@ -21,10 +21,14 @@
 #include <string.h>
 
 #define DEFAULT_CAP 4096
+/* Refuse allocations beyond this. The fetch path already caps at 2GB; this
+ * bounds every other caller so a bad length cannot ask for gigabytes. */
+#define SNAP_BUF_MAX_CAP ((size_t)1 << 40)   /* 1 TiB */
 
 void snap_buffer_init(snap_buffer_t *buf, size_t initial_cap) {
     if (!buf) return;
     buf->cap = initial_cap > 0 ? initial_cap : DEFAULT_CAP;
+    if (buf->cap > SNAP_BUF_MAX_CAP) buf->cap = SNAP_BUF_MAX_CAP;
     buf->len = 0;
     buf->data = malloc(buf->cap);
     if (!buf->data) buf->cap = 0;
@@ -33,9 +37,21 @@ void snap_buffer_init(snap_buffer_t *buf, size_t initial_cap) {
 void snap_buffer_append(snap_buffer_t *buf, const uint8_t *data, size_t len) {
     if (!buf || !data || len == 0) return;
     if (!buf->data) return; /* prior OOM: stay empty rather than crash */
-    if (buf->len + len > buf->cap) {
-        size_t new_cap = buf->cap ? buf->cap * 2 : DEFAULT_CAP;
-        while (buf->len + len > new_cap) new_cap *= 2;
+
+    /* Overflow-safe capacity computation. `buf->len + len` and `new_cap *= 2`
+     * could both wrap: a wrapped sum skips the growth entirely (then memcpy
+     * writes past the end), and a wrapped doubling spins forever. Compute in
+     * the remaining space and refuse anything above the cap. */
+    if (len > SNAP_BUF_MAX_CAP - buf->len) return;   /* absurd request */
+
+    size_t need = buf->len + len;
+    if (need > buf->cap) {
+        size_t new_cap = buf->cap ? buf->cap : DEFAULT_CAP;
+        while (new_cap < need) {
+            if (new_cap > SNAP_BUF_MAX_CAP / 2) { new_cap = SNAP_BUF_MAX_CAP; break; }
+            new_cap *= 2;
+        }
+        if (new_cap < need) return;                  /* cannot represent */
         uint8_t *new_data = realloc(buf->data, new_cap);
         if (!new_data) return; /* keep old buffer intact on OOM */
         buf->data = new_data;
