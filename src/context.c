@@ -27,10 +27,66 @@ static char *dup_or_null(const char *s) {
     return d;
 }
 
+static void snap_source_free_fields(snap_source_t *s) {
+    if (!s) return;
+    free(s->name);
+    free(s->url);
+    free(s->auth_header);
+    free(s->parser_config);
+    free(s->transform_config);
+    free(s->output_config);
+    free(s);
+}
+
+/* Despot truth: curl_global_init/cleanup used to be called once per context
+ * (new -> init, free -> cleanup). With two live contexts, freeing one tore
+ * down libcurl global state -- OpenSSL, proxy env, the resolver -- while the
+ * survivor kept using it, which is undefined behaviour. init is now done
+ * exactly once per process and cleanup is never called. */
+static pthread_once_t g_curl_once = PTHREAD_ONCE_INIT;
+static CURLcode g_curl_rc;
+
+static void curl_global_init_once(void) {
+    g_curl_rc = curl_global_init(CURL_GLOBAL_DEFAULT);
+}
+
+static void curl_ensure_init(void) {
+    pthread_once(&g_curl_once, curl_global_init_once);
+}
+
 snap_ctx_t *snap_ctx_new(void) {
-    snap_ctx_t *ctx = calloc(1, sizeof(snap_ctx_t));
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-    return ctx;
+    curl_ensure_init();
+    return calloc(1, sizeof(snap_ctx_t));
+}
+
+/* Reset a pipeline's parser for a fresh response.
+ *
+ * Two distinct problems, two distinct fixes:
+ *  - Without a reset the CSV parser keeps header_done=1 from the previous
+ *    poll and emits the header row as if it were data.
+ *  - Freeing and re-initing the ctx instead drops any callback the user
+ *    registered with snap_csv_set_callback(), so a re-polled source would
+ *    go completely silent after the first response.
+ * So prefer the parser's own reset (state only, callbacks kept); fall back
+ * to free+init only when a parser has no reset. */
+snap_error_t snap_pipeline_rearm(snap_pipeline_t *p) {
+    if (!p) return SNAP_ERR_CONFIG;
+    if (!p->parser.ctx) {
+        if (p->parser.init) {
+            return p->parser.init(&p->parser.ctx,
+                                 p->source ? p->source->parser_config : NULL);
+        }
+        return SNAP_OK;
+    }
+    if (p->parser.reset) return p->parser.reset(p->parser.ctx);
+
+    if (p->parser.free) p->parser.free(p->parser.ctx);
+    p->parser.ctx = NULL;
+    if (p->parser.init) {
+        return p->parser.init(&p->parser.ctx,
+                             p->source ? p->source->parser_config : NULL);
+    }
+    return SNAP_OK;
 }
 
 void snap_ctx_free(snap_ctx_t *ctx) {
@@ -43,15 +99,7 @@ void snap_ctx_free(snap_ctx_t *ctx) {
     
     for (int i = 0; i < ctx->n_pipelines; i++) {
         snap_pipeline_t *p = &ctx->pipelines[i];
-        if (p->source) {
-            free(p->source->name);
-            free(p->source->url);
-            free(p->source->auth_header);
-            free(p->source->parser_config);
-            free(p->source->transform_config);
-            free(p->source->output_config);
-            free(p->source);
-        }
+        if (p->source) snap_source_free_fields(p->source);
         if (p->parser.free && p->parser.ctx) p->parser.free(p->parser.ctx);
         if (p->transforms) {
             for (int j = 0; j < p->n_transforms; j++) {
@@ -63,9 +111,12 @@ void snap_ctx_free(snap_ctx_t *ctx) {
         if (p->output.free && p->output.ctx) p->output.free(p->output.ctx);
     }
     free(ctx->pipelines);
-    
-    if (ctx->multi_handle) curl_multi_cleanup(ctx->multi_handle);
-    curl_global_cleanup();
+    free(ctx->tasks);
+    free(ctx->next_due);
+
+    if (ctx->multi_handle) curl_multi_cleanup((CURLM *)ctx->multi_handle);
+    /* No curl_global_cleanup(): libcurl is initialised once per process and
+     * must outlive any context. See curl_ensure_init(). */
     free(ctx);
 }
 
@@ -103,16 +154,38 @@ snap_error_t snap_ctx_add_source(snap_ctx_t *ctx, const snap_source_t *src) {
         pipe->source = NULL;
         return SNAP_ERR_NOMEM;
     }
-    
+
+    /* Keep next_due in step with n_pipelines so the scheduler can arm a
+     * source added after snap_ctx_start(). */
+    if (ctx->running) {
+        double *grown = realloc(ctx->next_due,
+                                (size_t)(ctx->n_pipelines + 1) * sizeof(double));
+        if (!grown) {
+            snap_source_free_fields(pipe->source);
+            return SNAP_ERR_NOMEM;
+        }
+        ctx->next_due = grown;
+        ctx->next_due[ctx->n_pipelines] = 0.0;   /* due now */
+    }
+
     switch (src->format) {
         case SNAP_FMT_CSV: pipe->parser = snap_csv_parser; break;
         case SNAP_FMT_JSON: pipe->parser = snap_json_parser; break;
         case SNAP_FMT_NDJSON: pipe->parser = snap_ndjson_parser; break;
         default: pipe->parser = snap_csv_parser;
     }
-    
-    if (pipe->parser.init) pipe->parser.init(&pipe->parser.ctx, pipe->source->parser_config);
-    
+
+    if (pipe->parser.init) {
+        snap_error_t rc = pipe->parser.init(&pipe->parser.ctx,
+                                           pipe->source->parser_config);
+        if (rc != SNAP_OK) {
+            /* Despot truth: parser init failure used to be ignored, leaving
+             * a pipeline with a NULL ctx that failed opaquely on first use. */
+            snap_source_free_fields(pipe->source);
+            return rc;
+        }
+    }
+
     ctx->n_pipelines++;
     return SNAP_OK;
 }
@@ -122,10 +195,10 @@ snap_error_t snap_ctx_run_once(snap_ctx_t *ctx) {
     for (int i = 0; i < ctx->n_pipelines; i++) {
         snap_pipeline_t *p = &ctx->pipelines[i];
         if (!p->source) continue;
-        /* interval_sec == 0 means one-shot; interval > 0 sources are
-         * driven by snap_ctx_start()'s async loop or by the caller's
-         * own scheduler. Run them here too so run_once() is a useful
-         * synchronous snapshot for demos/tests. */
+        /* Each poll gets a fresh parser context: reusing one across polls
+         * replayed the CSV header row as a data record on every call after
+         * the first (header_done was never reset). */
+        if (snap_pipeline_rearm(p) != SNAP_OK) return SNAP_ERR_PARSE;
         snap_error_t rc = snap_fetch_once(p->source->url, p->source->auth_header,
                                           &p->parser, p->parser.ctx);
         if (rc != SNAP_OK) return rc;

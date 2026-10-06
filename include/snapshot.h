@@ -23,13 +23,18 @@
 #include <stdint.h>
 #include <time.h>
 #include <pthread.h>
-#include <curl/curl.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Forward declarations (keeps cJSON/curl specifics out of this header). */
+/* Forward declarations (keeps cJSON/curl specifics out of this header).
+ *
+ * Note curl/curl.h is deliberately NOT included: libcurl typedefs CURLM as
+ * `void`, so it cannot be forward-declared as an opaque struct type without
+ * colliding. Including it unconditionally meant every consumer of the buffer
+ * or the parsers -- none of which touch HTTP -- still needed libcurl headers
+ * installed. multi_handle is therefore void* here and cast inside fetch.c. */
 struct cJSON;
 
 /* ============================================================================
@@ -67,13 +72,17 @@ typedef struct snap_chunk {
     int is_final;
 } snap_chunk_t;
 
-/* Stream parser callbacks - process data chunk-by-chunk, never store full dataset */
+/* Stream parser callbacks - process data chunk-by-chunk, never store full dataset.
+ * reset (optional): clear per-parse state for a fresh response while KEEPING
+ * any callback the user registered. Recreating the whole ctx instead loses
+ * the callback, which is why a re-polled source went silent. */
 typedef struct snap_parser {
     void *ctx;
     snap_error_t (*init)(void **ctx, const char *config);
     snap_error_t (*feed)(void *ctx, const snap_chunk_t *chunk);
     snap_error_t (*flush)(void *ctx);
     void (*free)(void *ctx);
+    snap_error_t (*reset)(void *ctx);
 } snap_parser_t;
 
 /* Transform: modify/filter/enrich streaming records */
@@ -121,11 +130,18 @@ typedef struct snap_pipeline {
 typedef struct snap_ctx {
     snap_pipeline_t *pipelines;
     int n_pipelines;
-    CURLM *multi_handle;
+    void *multi_handle;   /* CURLM*, opaque here; see note above */
     int shutdown;
     int running;             /* async loop active (set by snap_ctx_start) */
     pthread_t loop_thread;   /* background curl_multi loop */
     int loop_thread_valid;
+    /* Live fetch tasks owned by the async loop. Tracked so an early exit can
+     * detach every still-running transfer before curl_multi_cleanup. */
+    struct fetch_task **tasks;
+    int n_tasks;
+    /* Scheduler: one wakeup deadline per pipeline (monotonic seconds).
+     * Zero interval means one-shot (never rescheduled). */
+    double *next_due;
 } snap_ctx_t;
 
 /* ============================================================================
@@ -148,6 +164,9 @@ snap_error_t snap_ctx_add_source(snap_ctx_t *ctx, const snap_source_t *src);
 snap_error_t snap_ctx_start(snap_ctx_t *ctx);
 snap_error_t snap_ctx_stop(snap_ctx_t *ctx);
 snap_error_t snap_ctx_run_once(snap_ctx_t *ctx);  /* Single snapshot all sources */
+/* Rebuild a pipeline's parser for a fresh poll. Required between polls: a
+ * reused parser keeps header_done set and replays the CSV header as data. */
+snap_error_t snap_pipeline_rearm(snap_pipeline_t *p);
 snap_error_t snap_ctx_load_config(snap_ctx_t *ctx, const char *config_file);
 /* Parse one {"name","url",...} source object (cJSON kept forward-declared). */
 snap_source_t *snap_source_from_json(struct cJSON *obj);
@@ -156,6 +175,16 @@ snap_source_t *snap_source_from_json(struct cJSON *obj);
  * context.c / examples need no private fetch_task_t knowledge). */
 snap_error_t snap_fetch_once(const char *url, const char *auth_header,
                              snap_parser_t *parser, void *parser_ctx);
+
+/* One-shot fetch of the raw body into a caller-owned buffer. This is the
+ * entry point for language bridges (see ldfd_bridge.py): bytes, not
+ * parsed records, with no callback on the hot path.
+ * `out` is reused, not reallocated. max_bytes caps the size (0 = no cap);
+ * exceeding it returns SNAP_ERR_OUTPUT instead of truncating silently.
+ * An HTTP status >= 400 is reported as SNAP_ERR_CURL, so a saved error
+ * page is never mistaken for a dataset. */
+snap_error_t snap_fetch_to_buffer(const char *url, const char *auth_header,
+                                  snap_buffer_t *out, size_t max_bytes);
 
 /* ============================================================================
  * Built-in Parsers
@@ -172,21 +201,17 @@ void snap_json_set_callback(void *parser_ctx,
                             void *udata);
 
 /* ============================================================================
- * Built-in Transforms
- * ============================================================================ */
-
-extern const snap_transform_t snap_filter_transform;   /* Filter rows by condition */
-extern const snap_transform_t snap_project_transform;  /* Select/rename columns */
-extern const snap_transform_t snap_enrich_transform;   /* Join with static data */
-
-/* ============================================================================
  * Built-in Outputs
+ *
+ * Only the sinks that exist are declared. kafka / s3 / http and the
+ * filter / project / enrich transforms were previously declared here with
+ * no definition anywhere in the tree: any program following the readme's
+ * transform and output tables failed to link. They are documented as
+ * roadmap in readme.md, not advertised as available API.
  * ============================================================================ */
 
-extern const snap_output_t snap_http_output;    /* POST to HTTP endpoint */
-extern const snap_output_t snap_kafka_output;   /* Produce to Kafka */
-extern const snap_output_t snap_s3_output;      /* PUT to S3-compatible */
-extern const snap_output_t snap_callback_output;/* User callback function */
+extern const snap_output_t snap_file_output;     /* append bytes to a file */
+extern const snap_output_t snap_callback_output; /* hand chunks to a C callback */
 
 #ifdef __cplusplus
 }
