@@ -1,0 +1,8 @@
+# Build artefacts
+obj/
+bin/
+libsnapshot.so
+*.o
+*.d
+
+# Test binaries are built into /tmp, not the tree

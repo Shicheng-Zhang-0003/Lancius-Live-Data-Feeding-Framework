@@ -4,26 +4,41 @@
 
 > **Implementation status (read before the spec below).** This readme
 > describes the full vision *plus* what exists today. Actually implemented:
-> growable buffers (`src/buffer.c`, null-safe), one-shot + async HTTP fetch
-> (`src/fetch.c` — `snap_fetch_once`, `snap_ctx_start/stop/run_once` with a
-> dedicated `loop_thread`, modern `XFERINFO` callback, header-list ownership),
-> header-aware streaming CSV parsing (`src/parser_csv.c` — quoted fields,
-> custom `delimiter=`/`skip=N` config, correct header ownership, CRLF-safe),
-> buffered JSON-array + line-split NDJSON parsing (`src/parser_json.c` with
-> `snap_json_set_callback`), JSON declarative source loading with validation
-> (`src/config.c` — `snap_ctx_load_config`, `snap_source_from_json`, invalid
-> rows skipped), the ecological associated-data module
-> (`include/assoc.h`, `src/assoc.c` — FIRMS/Daymet/GBIF, libc-only, tested),
-> and two examples (`examples/fire_monitor.c`, `examples/multi_pipeline.c`,
-> both on the public `snap_csv_set_callback` API).
-> `make` builds examples + `libsnapshot.so`; `make test` runs the network-free
-> assoc suite. **Roadmap, not yet built:** the declared `filter`/`project`/`enrich`
-> transforms, `http`/`kafka`/`s3`/`callback` outputs, binary/GeoTIFF/NetCDF
-> parsers, metrics/checkpointing/registry, and everything under
-> "Universal Data Pipeline v2". Performance figures (~50KB, 100MB/s,
-> <1ms, 50+ streams) are design targets, not benchmarks. Treat the v2
-> sections as the architecture RFC and the file list above as the buildable
-> truth.
+> growable buffers (`src/buffer.c`), one-shot + async HTTP fetch with a real
+> `interval_sec` scheduler (`src/fetch.c` — `snap_fetch_once`,
+> `snap_fetch_to_buffer`, `snap_ctx_start/stop/run_once`), header-aware
+> streaming CSV parsing with per-response `reset` (`src/parser_csv.c`),
+> buffered JSON-array + line-split NDJSON (`src/parser_json.c`), JSON
+> declarative source loading (`src/config.c`), the ecological
+> associated-data module (`include/assoc.h`, `src/assoc.c` — FIRMS/Daymet/
+> GBIF, libc-only), **output sinks** (`src/output.c` — file, callback, and
+> CSV-rows-to-JSONL), and **decompression** (`src/decompress.c` — streaming
+> gzip plus a tar reader with tar-slip guards). Three examples build.
+>
+> **Roadmap, not built:** Kafka/S3/HTTP sinks, websocket and SSE sources,
+> parquet/protobuf/msgpack parsers, checkpointing, metrics, schema
+> registry, and everything under "Universal Data Pipeline v2" below. The
+> `filter`/`project`/`enrich` transforms and the kafka/s3/http outputs were
+> previously *declared in the header with no definition anywhere*; those
+> declarations have been deleted rather than left to fail at link time.
+> Performance figures (~50KB, 100MB/s, <1ms, 50+ streams) are design
+> targets, not benchmarks. Treat the v2 sections as an architecture RFC
+> and the file list below as the buildable truth.
+
+## Testing
+
+```bash
+make test         # four dependency-free suites (libc + zlib), ~92 checks
+make test-fetch   # fetch/scheduler suite; needs libcurl headers, else SKIP
+make strict       # -Wconversion syntax check
+make analyze      # gcc -fanalyzer
+make sanitize     # ASan + UBSan over the dependency-free suites
+```
+
+`make test` never touches the network and exits non-zero on any failure.
+`make test-fetch` binds a loopback HTTP server and only ever dials
+127.0.0.1; without libcurl development headers it prints a SKIP rather than
+reporting a pass.
 
 ## Building
 
@@ -57,21 +72,33 @@ gcc -std=c17 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Iinclude \
 
 ```
 3463-LDFD/
-├── include/snapshot.h     # core types: buffer/chunk, parser/transform/output vtables,
-│                          #   source/pipeline/context, buffer + framework API
+├── include/snapshot.h     # core types: buffer/chunk, parser/transform/output
+│                          #   vtables, source/pipeline/context, framework API.
+│                          #   Deliberately does NOT include <curl/curl.h>.
 ├── include/parser_csv.h   # csv_row_cb_t + snap_csv_set_callback()
+├── include/output.h       # file / callback / row-to-JSONL sinks
+├── include/decompress.h   # streaming gzip + tar
 ├── include/assoc.h        # associated-data module (FIRMS/Daymet/GBIF, Idea1 feeds)
 ├── src/buffer.c           # growable reusable byte buffer
-├── src/context.c          # context lifecycle + source registration + run-once
-├── src/fetch.c            # libcurl easy (one-shot) + multi (async loop) fetch tasks
-├── src/parser_csv.c       # streaming CSV (quoted fields, custom delimiter)
-├── src/parser_json.c      # streaming JSON-array parser (NDJSON alias: same unit)
+├── src/context.c          # context lifecycle, source registration, run-once
+├── src/fetch.c            # libcurl one-shot fetch, buffer fetch, async loop,
+│                          #   interval scheduler, redirect/protocol hardening
+├── src/parser_csv.c       # streaming CSV (quoted fields, delimiter, skip=N)
+├── src/parser_json.c      # buffered JSON array + NDJSON, per-response reset
 ├── src/config.c           # snap_ctx_load_config() from declarative JSON
+├── src/output.c           # output sinks (file / callback / CSV-rows-to-JSONL)
+├── src/decompress.c       # zlib streaming inflate + tar extraction
 ├── src/assoc.c            # associated-data module (see dedicated section below)
-├── examples/fire_monitor.c      # hourly FIRMS poll, FRP>100 alert callback
-├── examples/multi_pipeline.c    # dual FIRMS + Daymet pipelines with stats thread
+├── examples/fire_monitor.c      # continuous FIRMS poll on the scheduler
+├── examples/multi_pipeline.c    # two sources on independent intervals
+├── examples/poll_once.c         # fetch once -> file, inflating gzip / untar
 ├── examples/pipeline_config.json# 4-source declarative config (FIRMS/GBIF/Daymet)
-└── tests/test_assoc.c     # 4 scenario tests for the assoc module (no network)
+└── tests/
+    ├── test_assoc.c          # 4 network-free assoc scenarios
+    ├── test_assoc_regress.c  # regressions for 9 defects found in audit
+    ├── test_core.c           # buffer, CSV edge cases, outputs (no curl)
+    ├── test_decompress.c     # gzip + tar incl. tar-slip, truncation
+    └── test_fetch.c          # fetch/scheduler vs a loopback server (needs curl)
 ```
 
 The Lancius Live Data Feeding Framework is a lightweight C library for building continuous data pipelines that fetch, parse, transform, and route live HTTP data streams — without ever writing to disk.
@@ -90,7 +117,9 @@ HTTP Source → Streaming Parser → Transforms → Output Sink
 
 ## Features
 
-- **Zero-copy streaming** — Data flows through reusable buffers; no full-dataset allocation
+- **Streaming** — Data flows through reusable buffers; no full-dataset allocation.
+  (Note: the CSV parser currently appends one byte at a time, so the
+  "zero-copy" and 100MB/s figures below are aspirational, not measured.)
 - **Async I/O** — `curl_multi` handles dozens of concurrent sources in one thread
 - **Composable pipelines** — Mix parsers, transforms, outputs per source
 - **Declarative config** — Define sources, transforms, outputs in JSON
@@ -186,9 +215,11 @@ snap_csv_set_callback(parser, on_row, my_context);
 > For FIRMS/Daymet/GBIF ecological feeds prefer the libc-only `assoc` module
 > below: it does header-name lookup and preamble handling without cJSON.
 
-## Built-in Transforms
+## Built-in Transforms (ROADMAP — not implemented)
 
-Configure via `transform_config` string:
+None of these exist; `snap_transform_t` has no built-in instances and the
+earlier header declarations were removed. Configure via `transform_config`
+when they land:
 
 | Transform | Syntax | Example |
 |-----------|--------|---------|
@@ -200,14 +231,17 @@ Expressions support: `> < >= <= == !=`, `&& ||`, parentheses.
 
 ## Built-in Outputs
 
-Configure via `output_config`:
+Two exist (`snap_file_output`, `snap_callback_output`, plus the
+CSV-rows-to-JSONL row sink in `include/output.h`). The rest below are
+roadmap.
 
 | Output | Config Format | Description |
 |--------|---------------|-------------|
-| HTTP | `http://host:port/path` | POST JSON batches |
-| Kafka | `kafka://broker:9092/topic` | Produce to topic |
-| S3 | `s3://bucket/prefix` | PUT objects (multipart) |
-| Callback | `callback://func_name` | Call registered C function |
+| File | *(built)* | append raw bytes to a path, atomically |
+| Callback | *(built)* | hand each chunk to a C function |
+| HTTP | `http://host:port/path` | POST JSON batches — ROADMAP |
+| Kafka | `kafka://broker:9092/topic` | Produce to topic — ROADMAP |
+| S3 | `s3://bucket/prefix` | PUT objects (multipart) — ROADMAP |
 
 ## Configuration File
 
@@ -300,10 +334,12 @@ const snap_output_t my_output = {
 
 ## Performance
 
-- **Throughput**: 100MB/s+ on modest hardware (network-bound)
-- **Latency**: <1ms parser-to-output for CSV/JSON
-- **Memory**: Fixed ~2MB base + configurable buffer pool
-- **Concurrency**: 50+ simultaneous HTTP streams per context
+- **Throughput**: 100MB/s+ on modest hardware (network-bound) — TARGET, not measured
+- **Latency**: <1ms parser-to-output for CSV/JSON — TARGET, not measured
+- **Memory**: Fixed ~2MB base + configurable buffer pool — TARGET
+- **Concurrency**: 50+ simultaneous HTTP streams per context — the async
+  loop is a single `curl_multi` thread and has only been exercised with a
+  handful of sources
 
 ## Use Cases
 
@@ -329,13 +365,13 @@ make install      # System install (requires root)
 ## Linking in Your Project
 
 ```bash
-# Static
+# Shared (build it first: make -C 3463-LDFD)
 gcc -std=c17 -I3463-LDFD/include your_app.c \
-    3463-LDFD/obj/*.o -lcurl -lcjson -lpthread -o your_app
+    -L3463-LDFD -lsnapshot -lcurl -lz -lpthread -o your_app
 
-# Shared
-gcc -std=c17 -I3463-LDFD/include your_app.c \
-    -L3463-LDFD -lsnapshot -o your_app
+From Python, prefer the ctypes bridge rather than hand-rolled ctypes:
+see ../ldfd_bridge.py, which exposes only buffer-in/buffer-out entry
+points so nothing is ever called back into Python from C.
 ```
 
 ## License
@@ -757,6 +793,9 @@ gcc -std=c17 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Iinclude \
     tests/test_assoc.c src/assoc.c -o /tmp/test_assoc && /tmp/test_assoc
 # assoc tests: all pass
 ```
+
+`tests/test_assoc_regress.c` pins the defects found in the v12R2
+integration audit; it fails 15/20 checks against the pre-fix `assoc.c`.
 
 The module is picked up by the normal `make` via the `src/*.c` wildcard, and
 `make install` ships `assoc.h` alongside `snapshot.h`.
